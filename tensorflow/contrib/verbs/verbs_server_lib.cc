@@ -33,6 +33,8 @@ RendezvousMgrInterface* NewRdmaRendezvousMgr(const WorkerEnv* env) {
   return new RdmaRendezvousMgr(env);
 }
 
+std::once_flag reg_mem_visitors_call;
+
 }  // namespace
 
 VerbsServer::VerbsServer(const ServerDef& server_def, Env* env)
@@ -78,6 +80,7 @@ Status VerbsServer::ChannelCacheFactory(const ServerDef& server_def,
 
 Status VerbsServer::Init(ServiceInitFunction service_func,
                          RendezvousMgrCreationFunction rendezvous_mgr_func) {
+  std::call_once(reg_mem_visitors_call, []() { RdmaMgr::RegMemVisitors(); });
   Status s = GrpcServer::Init(service_func, rendezvous_mgr_func);
   {
     mutex_lock l(mu_);
@@ -103,6 +106,8 @@ Status VerbsServer::Start() {
           ThreadOptions(), "TF_verbs_service",
           [this] { verbs_service_->HandleRPCsLoop(); }));
       rdma_mgr_->SetupChannels();
+      CHECK(rdma_mgr_->ConnectivityCheck()) << "Connectivity check failed!";
+      rdma_mgr_->InitAllocators();
       verbs_state_ = CONNECTED;
     }
   }

@@ -15,9 +15,10 @@
 r"""Simple speech recognition to spot a limited number of keywords.
 
 This is a self-contained example script that will train a very basic audio
-recognition model in TensorFlow. It can download the necessary training data,
-and runs with reasonable defaults to train within a few hours even only using a
-CPU. For more information see http://tensorflow.org/tutorials/audio_recognition.
+recognition model in TensorFlow. It downloads the necessary training data and
+runs with reasonable defaults to train within a few hours even only using a CPU.
+For more information, please see
+https://www.tensorflow.org/tutorials/audio_recognition.
 
 It is intended as an introduction to using neural networks for audio
 recognition, and is not a full speech recognition system. For more advanced
@@ -74,6 +75,7 @@ import os.path
 import sys
 
 import numpy as np
+from six.moves import xrange  # pylint: disable=redefined-builtin
 import tensorflow as tf
 
 import input_data
@@ -96,12 +98,12 @@ def main(_):
   model_settings = models.prepare_model_settings(
       len(input_data.prepare_words_list(FLAGS.wanted_words.split(','))),
       FLAGS.sample_rate, FLAGS.clip_duration_ms, FLAGS.window_size_ms,
-      FLAGS.window_stride_ms, FLAGS.dct_coefficient_count)
+      FLAGS.window_stride_ms, FLAGS.feature_bin_count, FLAGS.preprocess)
   audio_processor = input_data.AudioProcessor(
-      FLAGS.data_url, FLAGS.data_dir, FLAGS.silence_percentage,
-      FLAGS.unknown_percentage,
+      FLAGS.data_url, FLAGS.data_dir,
+      FLAGS.silence_percentage, FLAGS.unknown_percentage,
       FLAGS.wanted_words.split(','), FLAGS.validation_percentage,
-      FLAGS.testing_percentage, model_settings)
+      FLAGS.testing_percentage, model_settings, FLAGS.summaries_dir)
   fingerprint_size = model_settings['fingerprint_size']
   label_count = model_settings['label_count']
   time_shift_samples = int((FLAGS.time_shift_ms * FLAGS.sample_rate) / 1000)
@@ -112,16 +114,23 @@ def main(_):
   # example --how_many_training_steps=10000,3000 --learning_rate=0.001,0.0001
   # will run 13,000 training loops in total, with a rate of 0.001 for the first
   # 10,000, and 0.0001 for the final 3,000.
-  training_steps_list = map(int, FLAGS.how_many_training_steps.split(','))
-  learning_rates_list = map(float, FLAGS.learning_rate.split(','))
+  training_steps_list = list(map(int, FLAGS.how_many_training_steps.split(',')))
+  learning_rates_list = list(map(float, FLAGS.learning_rate.split(',')))
   if len(training_steps_list) != len(learning_rates_list):
     raise Exception(
         '--how_many_training_steps and --learning_rate must be equal length '
         'lists, but are %d and %d long instead' % (len(training_steps_list),
                                                    len(learning_rates_list)))
 
-  fingerprint_input = tf.placeholder(
+  input_placeholder = tf.placeholder(
       tf.float32, [None, fingerprint_size], name='fingerprint_input')
+  if FLAGS.quantize:
+    fingerprint_min, fingerprint_max = input_data.get_features_range(
+        model_settings)
+    fingerprint_input = tf.fake_quant_with_min_max_args(
+        input_placeholder, fingerprint_min, fingerprint_max)
+  else:
+    fingerprint_input = input_placeholder
 
   logits, dropout_prob = models.create_model(
       fingerprint_input,
@@ -131,7 +140,7 @@ def main(_):
 
   # Define loss and optimizer
   ground_truth_input = tf.placeholder(
-      tf.float32, [None, label_count], name='groundtruth_input')
+      tf.int64, [None], name='groundtruth_input')
 
   # Optionally we can add runtime checks to spot when NaNs or other symptoms of
   # numerical errors start occurring during training.
@@ -142,29 +151,31 @@ def main(_):
 
   # Create the back propagation and training evaluation machinery in the graph.
   with tf.name_scope('cross_entropy'):
-    cross_entropy_mean = tf.reduce_mean(
-        tf.nn.softmax_cross_entropy_with_logits(
-            labels=ground_truth_input, logits=logits))
-  tf.summary.scalar('cross_entropy', cross_entropy_mean)
+    cross_entropy_mean = tf.losses.sparse_softmax_cross_entropy(
+        labels=ground_truth_input, logits=logits)
+  if FLAGS.quantize:
+    tf.contrib.quantize.create_training_graph(quant_delay=0)
   with tf.name_scope('train'), tf.control_dependencies(control_dependencies):
     learning_rate_input = tf.placeholder(
         tf.float32, [], name='learning_rate_input')
     train_step = tf.train.GradientDescentOptimizer(
         learning_rate_input).minimize(cross_entropy_mean)
   predicted_indices = tf.argmax(logits, 1)
-  expected_indices = tf.argmax(ground_truth_input, 1)
-  correct_prediction = tf.equal(predicted_indices, expected_indices)
-  confusion_matrix = tf.confusion_matrix(expected_indices, predicted_indices)
+  correct_prediction = tf.equal(predicted_indices, ground_truth_input)
+  confusion_matrix = tf.confusion_matrix(
+      ground_truth_input, predicted_indices, num_classes=label_count)
   evaluation_step = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
-  tf.summary.scalar('accuracy', evaluation_step)
+  with tf.get_default_graph().name_scope('eval'):
+    tf.summary.scalar('cross_entropy', cross_entropy_mean)
+    tf.summary.scalar('accuracy', evaluation_step)
 
-  global_step = tf.contrib.framework.get_or_create_global_step()
+  global_step = tf.train.get_or_create_global_step()
   increment_global_step = tf.assign(global_step, global_step + 1)
 
   saver = tf.train.Saver(tf.global_variables())
 
   # Merge all the summaries and write them out to /tmp/retrain_logs (by default)
-  merged_summaries = tf.summary.merge_all()
+  merged_summaries = tf.summary.merge_all(scope='eval')
   train_writer = tf.summary.FileWriter(FLAGS.summaries_dir + '/train',
                                        sess.graph)
   validation_writer = tf.summary.FileWriter(FLAGS.summaries_dir + '/validation')
@@ -206,8 +217,11 @@ def main(_):
     # Run the graph with this batch of training data.
     train_summary, train_accuracy, cross_entropy_value, _, _ = sess.run(
         [
-            merged_summaries, evaluation_step, cross_entropy_mean, train_step,
-            increment_global_step
+            merged_summaries,
+            evaluation_step,
+            cross_entropy_mean,
+            train_step,
+            increment_global_step,
         ],
         feed_dict={
             fingerprint_input: train_fingerprints,
@@ -287,7 +301,7 @@ if __name__ == '__main__':
       '--data_url',
       type=str,
       # pylint: disable=line-too-long
-      default='http://download.tensorflow.org/data/speech_commands_v0.01.tar.gz',
+      default='http://download.tensorflow.org/data/speech_commands_v0.02.tar.gz',
       # pylint: enable=line-too-long
       help='Location of speech training data archive on the web.')
   parser.add_argument(
@@ -356,17 +370,18 @@ if __name__ == '__main__':
       '--window_size_ms',
       type=float,
       default=30.0,
-      help='How long each spectrogram timeslice is',)
+      help='How long each spectrogram timeslice is.',)
   parser.add_argument(
       '--window_stride_ms',
       type=float,
       default=10.0,
-      help='How long each spectrogram timeslice is',)
+      help='How far to move in time between spectogram timeslices.',)
   parser.add_argument(
-      '--dct_coefficient_count',
+      '--feature_bin_count',
       type=int,
       default=40,
-      help='How many bins to use for the MFCC fingerprint',)
+      help='How many bins to use for the MFCC fingerprint',
+  )
   parser.add_argument(
       '--how_many_training_steps',
       type=str,
@@ -422,6 +437,16 @@ if __name__ == '__main__':
       type=bool,
       default=False,
       help='Whether to check for invalid numbers during processing')
+  parser.add_argument(
+      '--quantize',
+      type=bool,
+      default=False,
+      help='Whether to train the model for eight-bit deployment')
+  parser.add_argument(
+      '--preprocess',
+      type=str,
+      default='mfcc',
+      help='Spectrogram processing mode. Can be "mfcc" or "average"')
 
   FLAGS, unparsed = parser.parse_known_args()
   tf.app.run(main=main, argv=[sys.argv[0]] + unparsed)

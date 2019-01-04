@@ -21,7 +21,6 @@ limitations under the License.
 #include "tensorflow/core/graph/subgraph.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session.h"
-#include "tensorflow/core/util/command_line_flags.h"
 #include "tensorflow/tools/graph_transforms/transform_utils.h"
 
 namespace tensorflow {
@@ -74,19 +73,6 @@ Status TypeForPlaceholder(const TransformFuncContext& context,
   return Status::OK();
 }
 
-// Takes a comma-separated string of numbers and parses them into a shape.
-bool TensorShapeFromString(const string& shape_string, TensorShape* result) {
-  if (shape_string.empty()) {
-    return false;
-  }
-  std::vector<int64> dims;
-  if (!str_util::SplitAndParseAsInts(shape_string, ',', &dims)) {
-    return false;
-  }
-  *result = TensorShape(dims);
-  return true;
-}
-
 Status ShapeForPlaceholder(const TransformFuncContext& context,
                            const string& node_name, TensorShape* result) {
   // If we don't find anything else, return scalar.
@@ -100,10 +86,7 @@ Status ShapeForPlaceholder(const TransformFuncContext& context,
           "strip_unused_nodes");
     }
     const string& shape_string = context.params.at("shape")[0];
-    if (!TensorShapeFromString(shape_string, result)) {
-      return errors::InvalidArgument("Couldn't understand shape argument '",
-                                     shape_string, "'");
-    }
+    TF_RETURN_IF_ERROR(TensorShapeFromString(shape_string, result));
   }
 
   // See if there's a particular type specified for this placeholder.
@@ -121,10 +104,7 @@ Status ShapeForPlaceholder(const TransformFuncContext& context,
     for (int i = 0; i < name_count; ++i) {
       if (context.params.at("name")[i] == node_name) {
         const string& shape_string = context.params.at("shape_for_name")[i];
-        if (!TensorShapeFromString(shape_string, result)) {
-          return errors::InvalidArgument("Couldn't understand shape argument '",
-                                         shape_string, "'");
-        }
+        TF_RETURN_IF_ERROR(TensorShapeFromString(shape_string, result));
       }
     }
   }

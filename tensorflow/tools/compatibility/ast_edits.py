@@ -21,10 +21,15 @@ from __future__ import print_function
 import ast
 import collections
 import os
+import re
 import shutil
 import sys
 import tempfile
 import traceback
+
+# Some regular expressions we will need for parsing
+FIND_OPEN = re.compile(r"^\s*(\[).*$")
+FIND_STRING_CHARS = re.compile(r"['\"]")
 
 
 class APIChangeSpec(object):
@@ -34,25 +39,32 @@ class APIChangeSpec(object):
 
   * `function_keyword_renames`: maps function names to a map of old -> new
     argument names
-  * `function_renames`: maps function names to new function names
+  * `symbol_renames`: maps function names to new function names
   * `change_to_function`: a set of function names that have changed (for
     notifications)
   * `function_reorders`: maps functions whose argument order has changed to the
     list of arguments in the new order
   * `function_handle`: maps function names to custom handlers for the function
+  * `function_warnings`: maps full names of functions to warnings that will be
+    printed out if the function is used. (e.g. tf.nn.convolution())
+  * `unrestricted_function_warnings`: maps names of functions to warnings that
+    will be printed out when the function is used (e.g. foo.convolution()).
+  * `function_keyword_additions`: maps function names to a map of arg->value
+    names that should be passed to the function.
 
   For an example, see `TFAPIChangeSpec`.
   """
 
 
-class _FileEditTuple(collections.namedtuple(
-    "_FileEditTuple", ["comment", "line", "start", "old", "new"])):
+class _FileEditTuple(
+    collections.namedtuple("_FileEditTuple",
+                           ["comment", "line", "start", "old", "new"])):
   """Each edit that is recorded by a _FileEditRecorder.
 
   Fields:
     comment: A description of the edit and why it was made.
     line: The line number in the file where the edit occurs (1-indexed).
-    start: The line number in the file where the edit occurs (0-indexed).
+    start: The column number in the file where the edit occurs (0-indexed).
     old: text string to remove (this must match what was in file).
     new: text string to add in place of `old`.
   """
@@ -175,14 +187,47 @@ class _ASTCallVisitor(ast.NodeVisitor):
     ast.NodeVisitor.generic_visit(self, node)
 
   def _rename_functions(self, node, full_name):
-    function_renames = self._api_change_spec.function_renames
+    symbol_renames = self._api_change_spec.symbol_renames
     try:
-      new_name = function_renames[full_name]
-      self._file_edit.add("Renamed function %r to %r" % (full_name,
-                                                         new_name),
+      new_name = symbol_renames[full_name]
+      self._file_edit.add("Renamed function %r to %r" % (full_name, new_name),
                           node.lineno, node.col_offset, full_name, new_name)
     except KeyError:
       pass
+
+  def _print_warning_for_function(self, node, full_name):
+    function_warnings = self._api_change_spec.function_warnings
+    try:
+      warning_message = function_warnings[full_name]
+      warning_message = warning_message.replace("<function name>", full_name)
+      self._file_edit.add(warning_message,
+                          node.lineno, node.col_offset, full_name, full_name,
+                          error="%s requires manual check." % full_name)
+    except KeyError:
+      pass
+
+  def _print_warning_for_function_unrestricted(self, node):
+    """Print a warning when specific functions are called.
+
+    The function _print_warning_for_function matches the full name of the called
+    function, e.g., tf.foo.bar(). This function matches the function name that
+    is called, as long as the function is an attribute. For example,
+    `tf.foo.bar()` and `foo.bar()` are matched, but not `bar()`.
+
+    Args:
+      node: ast.Call object
+    """
+    function_warnings = getattr(
+        self._api_change_spec, "unrestricted_function_warnings", {})
+    if isinstance(node.func, ast.Attribute):
+      function_name = node.func.attr
+      try:
+        warning_message = function_warnings[function_name]
+        self._file_edit.add(warning_message,
+                            node.lineno, node.col_offset, "", "",
+                            error="%s requires manual check." % function_name)
+      except KeyError:
+        pass
 
   def _get_attribute_full_path(self, node):
     """Traverse an attribute to generate a full name e.g. tf.foo.bar.
@@ -198,11 +243,11 @@ class _ASTCallVisitor(ast.NodeVisitor):
     items = []
     while not isinstance(curr, ast.Name):
       if not isinstance(curr, ast.Attribute):
-        return None
+        return None, None
       items.append(curr.attr)
       curr = curr.value
     items.append(curr.id)
-    return ".".join(reversed(items))
+    return ".".join(reversed(items)), items[0]
 
   def _find_true_position(self, node):
     """Return correct line number and column offset for a given node.
@@ -210,13 +255,12 @@ class _ASTCallVisitor(ast.NodeVisitor):
     This is necessary mainly because ListComp's location reporting reports
     the next token after the list comprehension list opening.
 
+    Returns:
+      lineno, offset for the given node
+
     Args:
       node: Node for which we wish to know the lineno and col_offset
     """
-    import re
-    find_open = re.compile("^\s*(\\[).*$")
-    find_string_chars = re.compile("['\"]")
-
     if isinstance(node, ast.ListComp):
       # Strangely, ast.ListComp returns the col_offset of the first token
       # after the '[' token which appears to be a bug. Workaround by
@@ -226,17 +270,17 @@ class _ASTCallVisitor(ast.NodeVisitor):
       # loop over lines
       while 1:
         # Reverse the text to and regular expression search for whitespace
-        text = self._lines[line-1]
+        text = self._lines[line - 1]
         reversed_preceding_text = text[:col][::-1]
         # First find if a [ can be found with only whitespace between it and
         # col.
-        m = find_open.match(reversed_preceding_text)
+        m = FIND_OPEN.match(reversed_preceding_text)
         if m:
           new_col_offset = col - m.start(1) - 1
           return line, new_col_offset
         else:
-          if (reversed_preceding_text=="" or
-             reversed_preceding_text.isspace()):
+          if (reversed_preceding_text == "" or
+              reversed_preceding_text.isspace()):
             line = line - 1
             prev_line = self._lines[line - 1]
             # TODO(aselle):
@@ -247,9 +291,9 @@ class _ASTCallVisitor(ast.NodeVisitor):
             # node ranges to filter out spurious #'s that appear in string
             # literals.
             comment_start = prev_line.find("#")
-            if comment_start ==  -1:
-              col = len(prev_line) -1
-            elif find_string_chars.search(prev_line[comment_start:]) is None:
+            if comment_start == -1:
+              col = len(prev_line) - 1
+            elif FIND_STRING_CHARS.search(prev_line[comment_start:]) is None:
               col = comment_start
             else:
               return None, None
@@ -259,17 +303,16 @@ class _ASTCallVisitor(ast.NodeVisitor):
     # it is not possible to use that in an argument.
     return node.lineno, node.col_offset
 
-
   def visit_Call(self, node):  # pylint: disable=invalid-name
     """Handle visiting a call node in the AST.
 
     Args:
       node: Current Node
     """
-
+    self._print_warning_for_function_unrestricted(node)
 
     # Find a simple attribute name path e.g. "tf.foo.bar"
-    full_name = self._get_attribute_full_path(node.func)
+    full_name, name = self._get_attribute_full_path(node.func)
 
     # Make sure the func is marked as being part of a call
     node.func.is_function_for_call = True
@@ -277,8 +320,11 @@ class _ASTCallVisitor(ast.NodeVisitor):
     if full_name:
       # Call special handlers
       function_handles = self._api_change_spec.function_handle
+      glob_name = "*.{}".format(name)
+      if glob_name in function_handles:
+        function_handles[glob_name](self._file_edit, node, self._lines)
       if full_name in function_handles:
-        function_handles[full_name](self._file_edit, node)
+        function_handles[full_name](self._file_edit, node, self._lines)
 
       # Examine any non-keyword argument and make it into a keyword argument
       # if reordering required.
@@ -292,18 +338,21 @@ class _ASTCallVisitor(ast.NodeVisitor):
           lineno, col_offset = self._find_true_position(arg)
           if lineno is None or col_offset is None:
             self._file_edit.add(
-                "Failed to add keyword %r to reordered function %r"
-                % (reordered[idx], full_name), arg.lineno, arg.col_offset,
-                "", "",
+                "Failed to add keyword %r to reordered function %r" %
+                (reordered[idx], full_name),
+                arg.lineno,
+                arg.col_offset,
+                "",
+                "",
                 error="A necessary keyword argument failed to be inserted.")
           else:
             keyword_arg = reordered[idx]
             if (full_name in function_keyword_renames and
                 keyword_arg in function_keyword_renames[full_name]):
               keyword_arg = function_keyword_renames[full_name][keyword_arg]
-            self._file_edit.add("Added keyword %r to reordered function %r"
-                                % (reordered[idx], full_name), lineno,
-                                col_offset, "", keyword_arg + "=")
+            self._file_edit.add("Added keyword %r to reordered function %r" %
+                                (reordered[idx], full_name), lineno, col_offset,
+                                "", keyword_arg + "=")
 
       # Examine each keyword argument and convert it to the final renamed form
       renamed_keywords = ({} if full_name not in function_keyword_renames else
@@ -321,11 +370,11 @@ class _ASTCallVisitor(ast.NodeVisitor):
             # value.
             key_start = argval_col_offset - len(argkey) - 1
             key_end = key_start + len(argkey) + 1
-            if (self._lines[argval_lineno - 1][key_start:key_end] ==
-                argkey + "="):
+            if (self._lines[argval_lineno - 1][key_start:key_end] == argkey +
+                "="):
               self._file_edit.add("Renamed keyword argument from %r to %r" %
-                                  (argkey, renamed_keywords[argkey]),
-                                  argval_lineno,
+                                  (argkey,
+                                   renamed_keywords[argkey]), argval_lineno,
                                   argval_col_offset - len(argkey) - 1,
                                   argkey + "=", renamed_keywords[argkey] + "=")
               continue
@@ -334,7 +383,8 @@ class _ASTCallVisitor(ast.NodeVisitor):
               (argkey, renamed_keywords[argkey]),
               argval.lineno,
               argval.col_offset - len(argkey) - 1,
-              "", "",
+              "",
+              "",
               error="Failed to find keyword lexographically. Fix manually.")
 
     ast.NodeVisitor.generic_visit(self, node)
@@ -345,13 +395,15 @@ class _ASTCallVisitor(ast.NodeVisitor):
     Args:
       node: Node that is of type ast.Attribute
     """
-    full_name = self._get_attribute_full_path(node)
+    full_name, _ = self._get_attribute_full_path(node)
     if full_name:
+      # Make sure the warning comes first, otherwise the name may have changed
+      self._print_warning_for_function(node, full_name)
       self._rename_functions(node, full_name)
     if full_name in self._api_change_spec.change_to_function:
       if not hasattr(node, "is_function_for_call"):
         new_text = full_name + "()"
-        self._file_edit.add("Changed %r to %r"%(full_name, new_text),
+        self._file_edit.add("Changed %r to %r" % (full_name, new_text),
                             node.lineno, node.col_offset, full_name, new_text)
 
     ast.NodeVisitor.generic_visit(self, node)
@@ -379,8 +431,8 @@ class ASTCodeUpgrader(object):
     # Write to a temporary file, just in case we are doing an implace modify.
     with open(in_filename, "r") as in_file, \
         tempfile.NamedTemporaryFile("w", delete=False) as temp_file:
-      ret = self.process_opened_file(
-          in_filename, in_file, out_filename, temp_file)
+      ret = self.process_opened_file(in_filename, in_file, out_filename,
+                                     temp_file)
 
     shutil.move(temp_file.name, out_filename)
     return ret
@@ -423,6 +475,7 @@ class ASTCodeUpgrader(object):
         out_file.write(out_text)
     text += "\n"
     return 1, text, process_errors
+
   # pylint: enable=broad-except
 
   def process_tree(self, root_directory, output_root_directory,
@@ -443,16 +496,16 @@ class ASTCodeUpgrader(object):
 
     # make sure output directory doesn't exist
     if output_root_directory and os.path.exists(output_root_directory):
-      print("Output directory %r must not already exist." % (
-          output_root_directory))
+      print("Output directory %r must not already exist." %
+            (output_root_directory))
       sys.exit(1)
 
     # make sure output directory does not overlap with root_directory
     norm_root = os.path.split(os.path.normpath(root_directory))
     norm_output = os.path.split(os.path.normpath(output_root_directory))
     if norm_root == norm_output:
-      print("Output directory %r same as input directory %r" % (
-          root_directory, output_root_directory))
+      print("Output directory %r same as input directory %r" %
+            (root_directory, output_root_directory))
       sys.exit(1)
 
     # Collect list of files to process (we do this to correctly handle if the
@@ -464,14 +517,16 @@ class ASTCodeUpgrader(object):
       copy_files = [f for f in file_list if not f.endswith(".py")]
       for filename in py_files:
         fullpath = os.path.join(dir_name, filename)
-        fullpath_output = os.path.join(
-            output_root_directory, os.path.relpath(fullpath, root_directory))
+        fullpath_output = os.path.join(output_root_directory,
+                                       os.path.relpath(fullpath,
+                                                       root_directory))
         files_to_process.append((fullpath, fullpath_output))
       if copy_other_files:
         for filename in copy_files:
           fullpath = os.path.join(dir_name, filename)
-          fullpath_output = os.path.join(
-              output_root_directory, os.path.relpath(fullpath, root_directory))
+          fullpath_output = os.path.join(output_root_directory,
+                                         os.path.relpath(
+                                             fullpath, root_directory))
           files_to_copy.append((fullpath, fullpath_output))
 
     file_count = 0

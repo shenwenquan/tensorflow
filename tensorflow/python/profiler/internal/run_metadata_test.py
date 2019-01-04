@@ -23,8 +23,10 @@ from collections import defaultdict
 import six
 
 from tensorflow.core.protobuf import config_pb2
+from tensorflow.core.protobuf import rewriter_config_pb2
 from tensorflow.python.client import session
 from tensorflow.python.framework import ops
+from tensorflow.python.framework import test_util
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import random_ops
 from tensorflow.python.ops import variables
@@ -65,11 +67,15 @@ def _run_model():
   w = random_ops.random_normal(shape=[SIZE, 2 * SIZE])
   y = math_ops.matmul(x, w)
 
-  with session.Session() as sess:
+  config = config_pb2.ConfigProto()
+  config.graph_options.rewrite_options.arithmetic_optimization = (
+      rewriter_config_pb2.RewriterConfig.OFF)
+  with session.Session(config=config) as sess:
     run_metadata = config_pb2.RunMetadata()
     opts = builder.time_and_memory()
     opts['min_micros'] = 0
     opts['min_bytes'] = 0
+    opts['order_by'] = 'name'
     opts['output'] = 'none'
     _ = sess.run(y,
                  options=config_pb2.RunOptions(
@@ -95,6 +101,7 @@ def _run_loop_model():
                  run_metadata=run_meta)
 
     opts = builder.time_and_memory()
+    opts['order_by'] = 'name'
     opts['output'] = 'none'
 
     tfprof_node = model_analyzer.profile(
@@ -119,6 +126,36 @@ class RunMetadataTest(test.TestCase):
     self.assertEqual(len(ret['gpu:0']), 1)
     self.assertEqual(len(ret['gpu:0/stream:all']), 1, '%s' % run_meta)
 
+  def testAllocationHistory(self):
+    if not test.is_gpu_available(cuda_only=True):
+      return
+
+    gpu_dev = test.gpu_device_name()
+    ops.reset_default_graph()
+    with ops.device(gpu_dev):
+      _, run_meta = _run_model()
+
+    mm = _extract_node(run_meta, 'MatMul')['gpu:0'][0]
+    mm_allocs = mm.memory[0].allocation_records
+    # has allocation and deallocation.
+    self.assertEqual(len(mm_allocs), 2)
+    # first allocated.
+    self.assertGreater(mm_allocs[1].alloc_micros, mm_allocs[0].alloc_micros)
+    self.assertGreater(mm_allocs[0].alloc_bytes, 0)
+    # Then deallocated.
+    self.assertLess(mm_allocs[1].alloc_bytes, 0)
+    # All memory deallocated.
+    self.assertEqual(mm_allocs[0].alloc_bytes + mm_allocs[1].alloc_bytes, 0)
+
+    rand = _extract_node(
+        run_meta, 'random_normal/RandomStandardNormal')['gpu:0'][0]
+    random_allocs = rand.memory[0].allocation_records
+    # random normal must allocated first since matmul depends on it.
+    self.assertLess(random_allocs[0].alloc_micros, mm.all_start_micros)
+    # deallocates the memory after matmul started.
+    self.assertGreater(random_allocs[1].alloc_micros, mm.all_start_micros)
+
+  @test_util.run_deprecated_v1
   def testCPU(self):
     ops.reset_default_graph()
     with ops.device('/cpu:0'):
@@ -132,13 +169,14 @@ class RunMetadataTest(test.TestCase):
     ret = _extract_node(run_meta, 'MatMul:MatMul')
     self.assertEqual(len(ret), 0)
 
+  @test_util.run_v1_only('b/120545219')
   def testLoopCPU(self):
     ops.reset_default_graph()
     with ops.device('/cpu:0'):
       tfprof_node, run_meta = _run_loop_model()
       # The while-loop caused a node to appear 4 times in scheduling.
       ret = _extract_node(run_meta,
-                          'rnn/while/rnn/basic_rnn_cell/basic_rnn_cell/MatMul')
+                          'rnn/while/basic_rnn_cell/MatMul')
       self.assertEqual(len(ret['cpu:0']), 4)
 
       total_cpu_execs = 0
@@ -147,7 +185,7 @@ class RunMetadataTest(test.TestCase):
 
       mm_node = lib.SearchTFProfNode(
           tfprof_node,
-          'rnn/while/rnn/basic_rnn_cell/basic_rnn_cell/MatMul')
+          'rnn/while/basic_rnn_cell/MatMul')
 
       self.assertEqual(mm_node.run_count, 4)
       self.assertEqual(mm_node.cpu_exec_micros, total_cpu_execs)
@@ -174,20 +212,16 @@ class RunMetadataTest(test.TestCase):
     for _, f in six.iteritems(back_to_forward):
       self.assertTrue(f in forward_op)
 
-  # pylint: disable=pointless-string-statement
-  """
-  # TODO(xpan): This test is flaky because RunMetadata returned from TensorFlow
-  # is random. Still being investigated.
   def testLoopGPU(self):
     if not test.is_gpu_available():
       return
 
     ops.reset_default_graph()
     with ops.device('/device:GPU:0'):
-      tfprof_node, run_meta = _run_loop_model()
+      _, run_meta = _run_loop_model()
       # The while-loop caused a node to appear 4 times in scheduling.
       ret = _extract_node(run_meta,
-                          'rnn/while/rnn/basic_rnn_cell/basic_rnn_cell/MatMul')
+                          'rnn/while/basic_rnn_cell/MatMul')
       self.assertEqual(len(ret['gpu:0']), 4, '%s' % run_meta)
 
       total_cpu_execs = 0
@@ -195,11 +229,6 @@ class RunMetadataTest(test.TestCase):
         total_cpu_execs += node.op_end_rel_micros
 
       self.assertGreaterEqual(len(ret['gpu:0/stream:all']), 4, '%s' % run_meta)
-
-      total_accelerator_execs = 0
-      for node in ret['gpu:0/stream:all']:
-        total_accelerator_execs += node.op_end_rel_micros
-  """
 
 
 if __name__ == '__main__':

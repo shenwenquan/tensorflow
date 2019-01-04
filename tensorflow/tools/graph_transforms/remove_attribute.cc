@@ -21,7 +21,6 @@ limitations under the License.
 #include "tensorflow/core/graph/subgraph.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session.h"
-#include "tensorflow/core/util/command_line_flags.h"
 #include "tensorflow/tools/graph_transforms/transform_utils.h"
 
 namespace tensorflow {
@@ -34,7 +33,7 @@ Status RemoveAttribute(const GraphDef& input_graph_def,
   if (!context.params.count("attribute_name") ||
       (context.params.at("attribute_name").size() != 1)) {
     return errors::InvalidArgument(
-        "remove_nodes expects exactly one 'attribute_name' "
+        "remove_attribute expects exactly one 'attribute_name' "
         "argument, e.g. remove_attribute(op_name=Mul, attribute_name=foo)");
   }
 

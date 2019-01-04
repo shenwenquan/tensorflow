@@ -273,7 +273,7 @@ void TestResizeBilinearOneDim() {
         << expected_val << ", " << resized_image_val;
   }
 
-  // Value testing with reference implemenatation
+  // Value testing with reference implementation
   CheckTensorValue<qint32>(image_quantized_tensor.flat<qint32>().data(),
                            outputs.at(0).flat<qint32>().data(),
                            /*batch_size=*/1,
@@ -373,22 +373,20 @@ void RunBenchmarkResizeBilinearTwoDims() {
 
 }  // namespace tensorflow
 
-#if defined(__ANDROID__)
-int main(int argc, char** argv) {
-#define RUN_TEST(t)            \
-  LOG(INFO) << "Test: " << #t; \
-  tensorflow::t();
-#else
 #define RUN_TEST(t) \
   TEST(QuantizationResizeBilenarTest, t) { tensorflow::t(); }
-#endif
 
-  RUN_TEST(TestResizeBilinearOneDim);
-  RUN_TEST(TestResizeBilinearTwoDims);
+RUN_TEST(TestResizeBilinearOneDim);
+RUN_TEST(TestResizeBilinearTwoDims);
 
 #if defined(__ANDROID__)
-  RUN_TEST(RunBenchmarkResizeBilinearTwoDims);
-  LOG(INFO) << "All tests complete.";
-  return 0;
+
+RUN_TEST(RunBenchmarkResizeBilinearTwoDims);
+
+#endif  // __ANDROID__
+
+int main(int argc, char** argv) {
+  // On Linux, add: FLAGS_logtostderr = true;
+  ::testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
 }
-#endif

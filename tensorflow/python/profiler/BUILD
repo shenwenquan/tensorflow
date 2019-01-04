@@ -53,10 +53,14 @@ cuda_py_test(
         "//tensorflow/python:client",
         "//tensorflow/python:client_testlib",
         "//tensorflow/python:framework_for_generated_wrappers",
+        "//tensorflow/python:distributed_framework_test_lib",
         "//tensorflow/python:platform",
         "//tensorflow/python:variables",
     ],
-    tags = ["no_pip"],
+    tags = [
+        "no_pip",
+        "oss_serial",
+    ],
 )
 
 cuda_py_test(
@@ -82,6 +86,7 @@ py_library(
         "//tensorflow/core/profiler:protos_all_py",
         "//tensorflow/python:framework_for_generated_wrappers",
         "//tensorflow/python:platform",
+        "//tensorflow/python/profiler/internal:flops_registry",
         "@six_archive//:six",
     ],
 )
@@ -112,6 +117,21 @@ py_library(
     ],
 )
 
+cuda_py_test(
+    name = "profile_context_test",
+    srcs = ["profile_context_test.py"],
+    additional_deps = [
+        ":profile_context",
+        "//tensorflow/python:client",
+        "//tensorflow/python:client_testlib",
+        "//tensorflow/python:framework_for_generated_wrappers",
+        "//tensorflow/python:platform",
+        "//tensorflow/python/profiler/internal:model_analyzer_testlib",
+        "//tensorflow/python:variables",
+    ],
+    tags = ["no_pip"],
+)
+
 py_library(
     name = "pprof_profiler",
     srcs = ["pprof_profiler.py"],
@@ -135,19 +155,4 @@ py_test(
         "//tensorflow/python:math_ops",
         "@com_google_pprof//:pprof_proto_py",
     ],
-)
-
-# -----------------------------------------------------------------------------
-# Google-internal targets.  These must be at the end for syncrepo.
-
-filegroup(
-    name = "all_files",
-    srcs = glob(
-        ["**/*"],
-        exclude = [
-            "**/METADATA",
-            "**/OWNERS",
-        ],
-    ),
-    visibility = ["//tensorflow:__subpackages__"],
 )

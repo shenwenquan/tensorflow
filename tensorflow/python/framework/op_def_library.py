@@ -19,7 +19,6 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-from autograd import core as ag_core
 import six
 
 from tensorflow.core.framework import attr_value_pb2
@@ -483,7 +482,8 @@ class OpDefLibrary(object):
               else:
                 raise TypeError("%s that don't all match." % prefix)
             else:
-              raise TypeError("%s that are invalid." % prefix)
+              raise TypeError(
+                  "%s that are invalid. Tensors: %s" % (prefix, values))
 
           types = [x.dtype for x in values]
           inputs.extend(values)
@@ -503,7 +503,6 @@ class OpDefLibrary(object):
             default_dtype = default_type_attr_map[input_arg.type_attr]
 
           try:
-            values = ag_core.getval(values)
             values = ops.internal_convert_to_tensor(
                 values,
                 name=input_arg.name,
@@ -571,7 +570,7 @@ class OpDefLibrary(object):
                   "than minimum length %d." %
                   (input_name, op_type_name, len(values), num_attr.minimum))
           # All tensors must have the same base type.
-          if any([bt != base_types[0] for bt in base_types]):
+          if any(bt != base_types[0] for bt in base_types):
             raise TypeError(
                 "All tensors passed to '%s' of '%s' Op "
                 "must have the same type." %

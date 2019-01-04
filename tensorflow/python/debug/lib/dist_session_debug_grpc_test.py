@@ -44,6 +44,7 @@ from tensorflow.python.platform import test
 from tensorflow.python.platform import tf_logging
 
 
+@test_util.run_v1_only("b/120545219")
 class DistributedSessionDebugTest(test_util.TensorFlowTestCase):
   """Test the debugging of distributed sessions."""
 
@@ -118,8 +119,8 @@ class DistributedSessionDebugTest(test_util.TensorFlowTestCase):
     """
     with ops.Graph().as_default() as graph:
       with ops.device("/job:worker/task:0/cpu:0"):
-        self.a = variables.Variable(10.0, name="a")
-        self.b = variables.Variable(100.0, name="b")
+        self.a = variables.VariableV1(10.0, name="a")
+        self.b = variables.VariableV1(100.0, name="b")
         self.inc_a = state_ops.assign_add(self.a, 2.0, name="inc_a")
         self.dec_b = state_ops.assign_add(self.b, -5.0, name="dec_b")
         self.p = math_ops.multiply(self.inc_a, self.dec_b, name="p")
@@ -155,8 +156,6 @@ class DistributedSessionDebugTest(test_util.TensorFlowTestCase):
           debug_urls=[self.debug_server_url])
 
       for i in xrange(4):
-        # N.B.: These requests will be fulfilled not in this debugged
-        # Session.run() invocation, but in the next one.
         if i % 2 == 0:
           self.debug_server.request_watch("p", 0, "DebugIdentity")
         else:
@@ -184,12 +183,12 @@ class DistributedSessionDebugTest(test_util.TensorFlowTestCase):
         # Due to the gRPC gating of the debug op for "p", the debug tensor
         # should be available on odd-indexed runs.
         if i % 2 == 0:
-          self.assertNotIn("p:0:DebugIdentity",
-                           self.debug_server.debug_tensor_values)
-        else:
           self.assertAllClose(
               [expected_p],
               self.debug_server.debug_tensor_values["p:0:DebugIdentity"])
+        else:
+          self.assertNotIn("p:0:DebugIdentity",
+                           self.debug_server.debug_tensor_values)
 
         self.assertNotIn("b:0:DebugIdentity",
                          self.debug_server.debug_tensor_values)

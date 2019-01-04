@@ -41,8 +41,11 @@ size_t elemByteSize(TF_DataType dtype) {
   // have the same byte sizes. Validate that:
   switch (dtype) {
     case TF_BOOL:
+    case TF_UINT8:
       static_assert(sizeof(jboolean) == 1,
                     "Java boolean not compatible with TF_BOOL");
+      static_assert(sizeof(jbyte) == 1,
+                    "Java byte not compatible with TF_UINT8");
       return 1;
     case TF_FLOAT:
     case TF_INT32:
@@ -90,6 +93,7 @@ void writeScalar(JNIEnv* env, jobject src, TF_DataType dtype, void* dst,
     CASE(TF_DOUBLE, jdouble, "doubleValue", "()D", Double);
     CASE(TF_INT32, jint, "intValue", "()I", Int);
     CASE(TF_INT64, jlong, "longValue", "()J", Long);
+    CASE(TF_UINT8, jbyte, "byteValue", "()B", Byte);
 #undef CASE
     case TF_BOOL: {
       jclass clazz = env->FindClass("java/lang/Boolean");
@@ -134,6 +138,7 @@ size_t write1DArray(JNIEnv* env, jarray array, TF_DataType dtype, void* dst,
     CASE(TF_INT32, jint, Int);
     CASE(TF_INT64, jlong, Long);
     CASE(TF_BOOL, jboolean, Boolean);
+    CASE(TF_UINT8, jbyte, Byte);
 #undef CASE
     default:
       throwException(env, kIllegalStateException, "invalid DataType(%d)",
@@ -168,6 +173,7 @@ size_t read1DArray(JNIEnv* env, TF_DataType dtype, const void* src,
     CASE(TF_INT32, jint, Int);
     CASE(TF_INT64, jlong, Long);
     CASE(TF_BOOL, jboolean, Boolean);
+    CASE(TF_UINT8, jbyte, Byte);
 #undef CASE
     default:
       throwException(env, kIllegalStateException, "invalid DataType(%d)",
@@ -394,7 +400,13 @@ size_t nonScalarTF_STRINGTensorSize(JNIEnv* env, jarray value, int num_dims) {
   for (jsize i = 0; i < len; ++i) {
     jarray elem = static_cast<jarray>(
         env->GetObjectArrayElement(static_cast<jobjectArray>(value), i));
+    if (elem == nullptr) {
+      throwException(env, kNullPointerException,
+                     "null entries in provided array");
+      return ret;
+    }
     ret += nonScalarTF_STRINGTensorSize(env, elem, num_dims - 1);
+    if (env->ExceptionCheck()) return ret;
   }
   return ret;
 }
@@ -415,8 +427,8 @@ void fillNonScalarTF_STRINGTensorData(JNIEnv* env, jarray value, int num_dims,
   for (jsize i = 0; i < len; ++i) {
     jarray elem = static_cast<jarray>(
         env->GetObjectArrayElement(static_cast<jobjectArray>(value), i));
-    if (TF_GetCode(status) != TF_OK) return;
     fillNonScalarTF_STRINGTensorData(env, elem, num_dims - 1, writer, status);
+    if (TF_GetCode(status) != TF_OK) return;
   }
 }
 }  // namespace
@@ -438,6 +450,7 @@ JNIEXPORT jlong JNICALL Java_org_tensorflow_Tensor_allocateNonScalarBytes(
   }
   const size_t encoded_size =
       nonScalarTF_STRINGTensorSize(env, value, num_dims);
+  if (env->ExceptionCheck()) return 0;
   TF_Tensor* t = TF_AllocateTensor(TF_STRING, dims, num_dims,
                                    8 * num_elements + encoded_size);
   if (t == nullptr) {

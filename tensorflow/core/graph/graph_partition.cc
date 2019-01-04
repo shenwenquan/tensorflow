@@ -22,6 +22,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "tensorflow/core/framework/function.h"
 #include "tensorflow/core/framework/memory_types.h"
 #include "tensorflow/core/framework/node_def_builder.h"
 #include "tensorflow/core/framework/tensor.pb.h"
@@ -35,6 +36,7 @@ limitations under the License.
 #include "tensorflow/core/graph/tensor_id.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/hash/hash.h"
+#include "tensorflow/core/lib/strings/str_util.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/util/device_name_utils.h"
 
@@ -117,14 +119,14 @@ DataType EdgeType(const Edge* e) {
   }
 }
 
-// Return true iff we need to add a same device send/recv for 'edge'.
+// Return true iff we need to add the same device send/recv for 'edge'.
 bool NeedSameDeviceSendRecv(const Edge* edge, const GraphInfo& info) {
   if (edge->IsControlEdge()) {
     return false;
   }
 
-  Node* src = edge->src();
-  Node* dst = edge->dst();
+  const Node* src = edge->src();
+  const Node* dst = edge->dst();
   if (src->assigned_device_name() == dst->assigned_device_name()) {
     int src_port = edge->src_output();
     int dst_port = edge->dst_input();
@@ -141,7 +143,7 @@ bool NeedSameDeviceSendRecv(const Edge* edge, const GraphInfo& info) {
 
 // Return true iff (dst, dst_input) is specified on host memory.
 bool IsDstInputOnHost(const Edge* edge, const GraphInfo& info) {
-  Node* dst = edge->dst();
+  const Node* dst = edge->dst();
   int dst_port = edge->dst_input();
   if (info.device_types[dst->id()] != DEVICE_CPU) {
     if (edge->IsControlEdge()) return false;
@@ -207,12 +209,21 @@ NodeDef* AddSend(const PartitionOptions& opts, const GraphInfo& g_info,
   // NOTE(yuanbyu): Only cast for cross-device send/recv.
   if (dtype != cast_dtype && !NeedSameDeviceSendRecv(edge, g_info)) {
     const string cast_op = (host_memory) ? "_HostCast" : "Cast";
-    NodeDefBuilder cast_builder(opts.new_name(src->name()), cast_op);
+    NodeDefBuilder cast_builder(opts.new_name(src->name()), cast_op,
+                                NodeDebugInfo(*src));
     cast_builder.Device(src->assigned_device_name()).Input(send_from);
     if (opts.scheduling_for_recvs) {
       cast_builder.Attr("_start_time", start_time);
     }
     cast_builder.Attr("DstT", cast_dtype);
+
+    if (cast_dtype == DT_BFLOAT16) {
+      // the below attribute specifies that the cast to bfloat16 should use
+      // truncation. This is needed to retain legacy behavior when we change
+      // the default bfloat16 casts to use rounding instead of truncation
+      cast_builder.Attr("Truncate", true);
+    }
+
     NodeDef* cast = gdef->add_node();
     *status = cast_builder.Finalize(cast);
     if (!status->ok()) return nullptr;
@@ -223,7 +234,8 @@ NodeDef* AddSend(const PartitionOptions& opts, const GraphInfo& g_info,
 
   // Add the send node.
   const string send_op = (host_memory) ? "_HostSend" : "_Send";
-  NodeDefBuilder send_builder(opts.new_name(src->name()), send_op);
+  NodeDefBuilder send_builder(opts.new_name(src->name()), send_op,
+                              NodeDebugInfo(*src));
   SetSendRecvAttrs(opts, edge, &send_builder);
   send_builder.Device(src->assigned_device_name()).Input(send_from);
   if (opts.scheduling_for_recvs) {
@@ -258,7 +270,8 @@ NodeDef* AddRecv(const PartitionOptions& opts, const GraphInfo& g_info,
 
   // Add the recv node.
   const string recv_op = (host_memory) ? "_HostRecv" : "_Recv";
-  NodeDefBuilder recv_builder(opts.new_name(src->name()), recv_op);
+  NodeDefBuilder recv_builder(opts.new_name(src->name()), recv_op,
+                              NodeDebugInfo(*src));
   SetSendRecvAttrs(opts, edge, &recv_builder);
   recv_builder.Device(dst->assigned_device_name())
       .Attr("tensor_type", cast_dtype);
@@ -270,7 +283,8 @@ NodeDef* AddRecv(const PartitionOptions& opts, const GraphInfo& g_info,
   // Add the cast node (from cast_dtype to dtype) or an Identity node.
   if (dtype != cast_dtype) {
     const string cast_op = (host_memory) ? "_HostCast" : "Cast";
-    NodeDefBuilder cast_builder(opts.new_name(src->name()), cast_op);
+    NodeDefBuilder cast_builder(opts.new_name(src->name()), cast_op,
+                                NodeDebugInfo(*src));
     cast_builder.Attr("DstT", dtype);
     cast_builder.Device(dst->assigned_device_name())
         .Input(recv->name(), 0, cast_dtype);
@@ -280,7 +294,8 @@ NodeDef* AddRecv(const PartitionOptions& opts, const GraphInfo& g_info,
     return cast;
   } else if (edge->IsControlEdge()) {
     // An Identity is only needed for control edges.
-    NodeDefBuilder id_builder(opts.new_name(src->name()), "Identity");
+    NodeDefBuilder id_builder(opts.new_name(src->name()), "Identity",
+                              NodeDebugInfo(*src));
     id_builder.Device(dst->assigned_device_name())
         .Input(recv->name(), 0, cast_dtype);
     NodeDef* id = gdef->add_node();
@@ -372,7 +387,7 @@ string ControlLoopName(const string& name) {
 
 bool IsControlLoop(const Node* node) {
   const string& name = node->name();
-  return StringPiece(name).starts_with("_cloop");
+  return str_util::StartsWith(name, "_cloop");
 }
 
 // An enter node for control flow.
@@ -728,7 +743,10 @@ Status AddControlFlow(const PartitionOptions& opts, Graph* g,
             strings::StrCat(dst_frame_name, "$$", dst_device);
         ControlLoop loop = control_loops[cl_key];
         DCHECK(loop.enter != nullptr);
-        g->AddControlEdge(loop.merge, dst);
+        // Note that we'll create multiple duplicate edges if dst has multiple
+        // cross-device inputs. This is expected by the logic in Partition(), so
+        // it can add control edges to the recv nodes once they're created.
+        g->AddControlEdge(loop.merge, dst, /*allow_duplicates=*/true);
       }
     }
   }
@@ -781,7 +799,7 @@ Status TopologicalSortNodesWithTimePriority(
   for (int n = 0; n < gdef->node_size(); ++n) {
     const NodeDef* ndef = &gdef->node(n);
     for (int i = 0; i < ndef->input_size(); ++i) {
-      node_to_output_nodes[ParseTensorName(ndef->input(i)).first.ToString()]
+      node_to_output_nodes[string(ParseTensorName(ndef->input(i)).first)]
           .push_back(ndef);
     }
     int64 start_time;
@@ -969,6 +987,7 @@ Status Partition(const PartitionOptions& opts, Graph* g,
     GraphDef* dst_graph = &(*partitions)[dstp];
     NodeDef* dst_def = dst_graph->add_node();
     *dst_def = dst->def();
+    MergeDebugInfo(NodeDebugInfo(dst->def()), dst_def);
     dst_def->set_device(dst->assigned_device_name());
     dst_def->clear_input();  // Inputs are filled below
     if (opts.need_to_record_start_times) {
@@ -1113,7 +1132,7 @@ Status Partition(const PartitionOptions& opts, Graph* g,
         // before the data is available.
         AddInput(real_recv, send->name(), Graph::kControlSlot);
       } else if (control_flow_edge != nullptr) {
-        // Redirect control edge to the real recv since this is not a same
+        // Redirect control edge to the real recv since this is not the same
         // device send/recv.
         --num_control_flow_edges;
         AddInput(real_recv, control_flow_edge->src()->name(),
@@ -1149,7 +1168,7 @@ Status Partition(const PartitionOptions& opts, Graph* g,
     // Add control edges from 'ref_control_inputs' to 'ref_recvs'.
     // NOTE(yuanbyu): Adding these control edges should not introduce
     // deadlocks. 'dst' has implicit "read" nodes that, when we split
-    // across devices, are made explicit; Retargettig the dependencies
+    // across devices, are made explicit; Retargeting the dependencies
     // to 'dst' to those nodes would not introduce cycles if there isn't
     // one before the transformation.
     // NOTE(yuanbyu): This may impact performance because it defers the
@@ -1174,7 +1193,8 @@ Status Partition(const PartitionOptions& opts, Graph* g,
   for (auto& it : *partitions) {
     GraphDef* gdef = &it.second;
     *gdef->mutable_versions() = g->versions();
-    *gdef->mutable_library() = flib_def->ToProto();
+    // Prune unreachable functions from `flib_def` before adding them to `gdef`.
+    *gdef->mutable_library() = flib_def->ReachableDefinitions(*gdef).ToProto();
 
     // Traverse the graph to fill every send/recv op's incarnation
     // information.
